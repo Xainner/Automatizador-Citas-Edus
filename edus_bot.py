@@ -225,7 +225,14 @@ async def reg_clave(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cedula=context.user_data["cedula"],
         clave=clave,
     )
-    await update.message.reply_text(
+
+    # Seguridad: borrar el mensaje con la contraseña del chat
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    await update.effective_chat.send_message(
         "🎉 ¡Listo! Ya quedé registrado.\n\n"
         "Ahora puedes:\n"
         "• /buscar — buscar una cita ahora\n"
