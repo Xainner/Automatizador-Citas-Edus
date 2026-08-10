@@ -76,6 +76,10 @@ _captchas = {}
 _procesos = {}
 # chats que pidieron cancelar la búsqueda en curso
 _cancelados = set()
+# último waiting.txt resuelto por chat (deduplicación de captchas)
+_ultimo_waiting = {}
+# contador de captchas resueltos por chat en la búsqueda actual
+_n_captcha = {}
 
 # Búsquedas en curso por chat (evita duplicados)
 _buscando = set()
@@ -362,18 +366,24 @@ async def ejecutar_busqueda(chat, user, fecha_objetivo: str = ""):
             elif "Login" in texto and ("falló" in texto or "incorrecta" in texto or "Error" in texto):
                 resultado = "login_fallido"
 
-            # ¿El script pidió un captcha?
+            # ¿El script pidió un captcha? (solo si es uno NUEVO, no el ya resuelto)
             waiting = captcha_dir / "waiting.txt"
             if waiting.exists():
-                vision = db.obtener_vision(chat.id)
-                await resolver_captcha(chat, captcha_dir, waiting, vision)
-                # Borrar para no reprocesar el mismo captcha en la próxima vuelta
-                try:
-                    waiting.unlink()
-                except Exception:
-                    pass
+                contenido = waiting.read_text().strip()
+                if contenido != _ultimo_waiting.get(chat.id):
+                    _ultimo_waiting[chat.id] = contenido
+                    _n_captcha[chat.id] = _n_captcha.get(chat.id, 0) + 1
+                    vision = db.obtener_vision(chat.id)
+                    await resolver_captcha(chat, captcha_dir, waiting, vision)
+                    # Borrar para no reprocesar el mismo captcha en la próxima vuelta
+                    try:
+                        waiting.unlink()
+                    except Exception:
+                        pass
     finally:
         _procesos.pop(chat.id, None)
+        _ultimo_waiting.pop(chat.id, None)
+        _n_captcha.pop(chat.id, None)
         try:
             await proc.wait()
         except Exception:
@@ -427,9 +437,15 @@ async def resolver_captcha(chat, captcha_dir: Path, waiting: Path, vision: dict 
     texto_ia = await resolver_captcha_con_ia(img_path, vision)
     if texto_ia:
         (captcha_dir / "resolved.txt").write_text(texto_ia)
-        await chat.send_message(
-            "🤖 Código de seguridad resuelto automáticamente. ¡Continúo! ✨"
-        )
+        intento = _n_captcha.get(chat.id, 1)
+        if intento > 1:
+            await chat.send_message(
+                f"🤖 Código de seguridad resuelto automáticamente (intento {intento}). ¡Continúo! ✨"
+            )
+        else:
+            await chat.send_message(
+                "🤖 Código de seguridad resuelto automáticamente. ¡Continúo! ✨"
+            )
         return
 
     # 2) Fallback: pedirle al usuario
