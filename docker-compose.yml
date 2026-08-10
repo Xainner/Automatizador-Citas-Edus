@@ -1,0 +1,51 @@
+# Automatizador de Citas EDUS — Docker Compose
+#   docker compose up -d --build          → levanta el bot (y cron si se habilita)
+#   docker compose up -d --build cron     → levanta solo el servicio cron
+#
+# Requiere un archivo .env con TELEGRAM_BOT_TOKEN y SECRET_KEY (ver .env.example)
+
+services:
+  bot:
+    build: .
+    image: automatizador-citas-edus:latest
+    container_name: edus-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - EDUS_DB_PATH=/app/data/edus_bot.db
+      - CAPTCHA_DIR=/app/data/captchas
+      - TZ=America/Costa_Rica
+    volumes:
+      - edus-data:/app/data
+      - edus-logs:/app/logs
+    networks:
+      - edus-net
+    command: ["python", "edus_bot.py"]
+
+  cron:
+    build: .
+    image: automatizador-citas-edus:latest
+    container_name: edus-cron
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - EDUS_DB_PATH=/app/data/edus_bot.db
+      - CAPTCHA_DIR=/app/data/captchas
+      - TZ=America/Costa_Rica
+    volumes:
+      - edus-data:/app/data
+      - edus-logs:/app/logs
+    networks:
+      - edus-net
+    command: ["/app/docker/entrypoint-cron.sh"]
+
+volumes:
+  edus-data:
+  edus-logs:
+
+networks:
+  edus-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

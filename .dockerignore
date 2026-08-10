@@ -1,0 +1,17 @@
+# Excluir del build de Docker
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.db
+captchas/
+data/
+logs/
+.env
+.env.example
+Dockerfile
+docker-compose.yml
+.dockerignore
+README.md
+LICENSE
+logo.png

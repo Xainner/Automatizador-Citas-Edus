@@ -1,0 +1,6 @@
+playwright>=1.62.0
+pillow>=12.0.0
+python-telegram-bot>=22.0
+python-dotenv>=1.0.0
+cryptography>=42.0.0
+httpx>=0.27.0
