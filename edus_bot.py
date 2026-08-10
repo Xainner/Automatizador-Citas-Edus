@@ -72,6 +72,10 @@ CAPTCHA_TIMEOUT = int(os.environ.get("CAPTCHA_TIMEOUT", "60"))
 
 # Captchas pendientes: chat_id -> (evento asyncio, texto resuelto)
 _captchas = {}
+# subprocesos de búsqueda en curso por chat (para poder cancelarlos)
+_procesos = {}
+# chats que pidieron cancelar la búsqueda en curso
+_cancelados = set()
 
 # Búsquedas en curso por chat (evita duplicados)
 _buscando = set()
@@ -330,6 +334,9 @@ async def ejecutar_busqueda(chat, user, fecha_objetivo: str = ""):
         await chat.send_message(f"❌ No pude iniciar la búsqueda: {e}")
         return
 
+    # Registrar el proceso para poder cancelarlo con /cancelar
+    _procesos[chat.id] = proc
+
     captcha_dir = CAPTCHA_DIR_BOT
     captcha_dir.mkdir(exist_ok=True)
 
@@ -366,10 +373,17 @@ async def ejecutar_busqueda(chat, user, fecha_objetivo: str = ""):
                 except Exception:
                     pass
     finally:
+        _procesos.pop(chat.id, None)
         try:
             await proc.wait()
         except Exception:
             pass
+
+    # Si el usuario canceló, reportarlo y terminar
+    if chat.id in _cancelados:
+        _cancelados.discard(chat.id)
+        await chat.send_message("🛑 Búsqueda cancelada. Cuando quieras, vuelve a intentar con /buscar.")
+        return
 
     # Traducir el resultado final
     if resultado == "reservada":
@@ -444,6 +458,12 @@ async def resolver_captcha(chat, captcha_dir: Path, waiting: Path, vision: dict 
         return
 
     texto = _captchas[chat_id]["texto"]
+
+    # El usuario canceló mientras esperaba el código
+    if texto == "__CANCELAR__":
+        await chat.send_message("🛑 Cancelado. Detengo la búsqueda.")
+        return
+
     (captcha_dir / "resolved.txt").write_text(texto)
     await chat.send_message("✅ ¡Gracias! Continúo con la búsqueda…")
 
@@ -710,9 +730,14 @@ async def vis_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    n = db.cancelar_pendientes(chat_id)
+    mensajes = []
 
-    # cancelar jobs en memoria (solo los de este chat)
+    # Cancelar búsqueda programadas
+    n = db.cancelar_pendientes(chat_id)
+    if n:
+        mensajes.append(f"🚫 Cancelé {n} búsqueda(s) programada(s).")
+
+    # Cancelar jobs en memoria (solo los de este chat)
     if context.job_queue:
         for job in context.job_queue.jobs():
             data = job.data or {}
@@ -722,13 +747,26 @@ async def cmd_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
-    if n:
-        await update.effective_chat.send_message(
-            f"🚫 Cancelé {n} búsqueda(s) programada(s)."
-        )
+    # Interrumpir una búsqueda en curso (esperando captcha o no)
+    pendiente = _captchas.get(chat_id)
+    if pendiente and not pendiente["evento"].is_set():
+        pendiente["texto"] = "__CANCELAR__"
+        pendiente["evento"].set()
+
+    proc = _procesos.get(chat_id)
+    if proc is not None and proc.returncode is None:
+        _cancelados.add(chat_id)
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        mensajes.append("🛑 Deteniendo la búsqueda en curso…")
+
+    if mensajes:
+        await update.effective_chat.send_message("\n".join(mensajes))
     else:
         await update.effective_chat.send_message(
-            "No tienes búsquedas programadas pendientes."
+            "No había búsquedas programadas ni en curso. 😌"
         )
 
 
