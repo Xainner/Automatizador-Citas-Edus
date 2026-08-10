@@ -669,7 +669,14 @@ async def vis_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def vis_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = update.message.text.strip()
     context.user_data["vis_key"] = key if key.lower() != "no" else ""
-    await update.message.reply_text(
+
+    # Seguridad: borrar el mensaje con la API key del chat
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    await update.effective_chat.send_message(
         "✅ Listo.\n\nAhora dime el *nombre del modelo*, por ejemplo: `gpt-4o-mini`",
         parse_mode=ParseMode.MARKDOWN,
     )
