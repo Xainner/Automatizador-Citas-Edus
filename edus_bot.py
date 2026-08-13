@@ -624,6 +624,13 @@ async def confirmar_programacion(update, context, user, fecha: str):
         )
     except Exception as e:
         print(f"[bot] No se pudo programar job: {e}")
+        db.marcar_programacion(prog_id, "cancelada")
+        await update.effective_chat.send_message(
+            "❌ Ocurrió un error al programar la búsqueda automática "
+            "(job_queue no disponible). La programación fue cancelada. "
+            "Reporta este error al administrador.",
+        )
+        return ConversationHandler.END
 
     await update.effective_chat.send_message(
         f"📅 *Búsqueda programada* para el *{formatear_fecha(fecha)}*.\n\n"
@@ -810,6 +817,40 @@ async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE, user):
     await update.effective_chat.send_message(texto, parse_mode=ParseMode.MARKDOWN)
 
 
+# ── Re-agendamiento al arranque ──────────────────────────────
+
+async def reagendar_pendientes(app: Application):
+    """Re-agenda en el job_queue las búsquedas pendientes guardadas en BD.
+
+    El job_queue de PTB vive en memoria: si el bot se reinicia, los jobs
+    desaparecen aunque la BD siga teniendo programaciones 'pendiente'.
+    Esta función las vuelve a programar al arrancar.
+    """
+    ahora = datetime.now(TZ_CR)
+    for p in db.programaciones_pendientes():
+        try:
+            fecha_dt = datetime.strptime(p["fecha"], "%d/%m/%Y")
+            cuando = datetime.combine(
+                fecha_dt.date(),
+                dt_time(HORA_BUSQUEDA, MINUTO_BUSQUEDA),
+                tzinfo=TZ_CR,
+            )
+            if cuando < ahora:
+                # Fecha pasada sin ejecutar: cancelar en vez de dejar huérfana
+                db.marcar_programacion(p["id"], "cancelada")
+                print(f"[bot] Programación #{p['id']} ({p['fecha']}) vencida sin ejecutar → cancelada")
+                continue
+            app.job_queue.run_once(
+                job_busqueda_programada,
+                when=cuando,
+                data={"prog_id": p["id"], "fecha": p["fecha"], "chat_id": p["telegram_id"]},
+                name=f"edus_prog_{p['id']}",
+            )
+            print(f"[bot] Re-agendada búsqueda #{p['id']} para {p['fecha']} a las {cuando:%H:%M} CR")
+        except Exception as e:
+            print(f"[bot] No se pudo re-agendar #{p['id']}: {e}")
+
+
 # ── Main ──────────────────────────────────────────────────────
 
 def main():
@@ -821,11 +862,12 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
-    # Comandos del menú
-    async def registrar_comandos(app: Application):
+    # Comandos del menú + re-agendar búsquedas pendientes tras un reinicio
+    async def post_init(app: Application):
         await app.bot.set_my_commands(COMANDOS)
+        await reagendar_pendientes(app)
 
-    app.post_init = registrar_comandos
+    app.post_init = post_init
 
     # Registro (conversación)
     conv_registro = ConversationHandler(
