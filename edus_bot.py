@@ -657,11 +657,22 @@ async def job_busqueda_programada(context: ContextTypes.DEFAULT_TYPE):
 
     _buscando.add(chat_id)
     try:
-        chat = await context.bot.get_chat(chat_id)
-        await chat.send_message(
-            f"⏰ ¡Llegó la hora! Busco citas para el *{formatear_fecha(fecha)}*. 🤞",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        # Reintentar el envío inicial: la red puede cortar conexiones idle.
+        # A los x minutos de espera el NAT/firewall suele cerrar el socket.
+        chat = None
+        for intento in range(1, 4):
+            try:
+                chat = await context.bot.get_chat(chat_id)
+                await chat.send_message(
+                    f"⏰ ¡Llegó la hora! Busco citas para el *{formatear_fecha(fecha)}*. 🤞",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                break
+            except Exception as e:
+                print(f"[bot] ⚠️ Envío inicial falló (intento {intento}): {e}")
+                if intento == 3:
+                    raise
+                await asyncio.sleep(5)
         await ejecutar_busqueda(chat, user, fecha)
     finally:
         _buscando.discard(chat_id)
@@ -860,7 +871,15 @@ def main():
         level=logging.INFO,
     )
 
-    app = Application.builder().token(TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .connect_timeout(30)
+        .read_timeout(60)
+        .write_timeout(60)
+        .pool_timeout(30)
+        .build()
+    )
 
     # Comandos del menú + re-agendar búsquedas pendientes tras un reinicio
     async def post_init(app: Application):
