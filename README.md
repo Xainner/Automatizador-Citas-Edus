@@ -53,10 +53,12 @@ Este proyecto fue generado a partir de la **guía/skill base** de **[jeudytuanis
 - 🔍 **Búsqueda inteligente** de cupos disponibles en tiempo real
 - 📅 **Reserva automática** del primer cupo disponible (con verificación real de éxito)
 - 🤖 **Bot de Telegram**: registra tus datos, busca al momento o programa búsquedas
-- ⏰ **Monitoreo programado** desde las 5:00 AM CST (cupos se liberan temprano)
+- ⏰ **Monitoreo programado** desde las **5:59 AM** hora CR (los cupos se liberan a esa hora)
 - 🔔 **Notificaciones** al reservar exitosamente una cita
 - 🛡️ **Seguridad**: credenciales cifradas (Fernet) y solo en variables de entorno, nunca en código
-- 🔄 **Auto-reintento**: si el CAPTCHA falla, descarga uno nuevo automáticamente
+- 🔄 **Auto-reintento**: si el CAPTCHA falla, descarga uno nuevo automáticamente (dedupe por mtime, sin repetir el mismo)
+- 🛑 **Cancelación real**: `/cancelar` mata el proceso completo de búsqueda (script + Chromium) en segundos
+- 🚪 **Cierre de sesión EDUS** al iniciar y terminar cada búsqueda — no deja sesiones pegadas en el servidor
 
 ---
 
@@ -65,7 +67,7 @@ Este proyecto fue generado a partir de la **guía/skill base** de **[jeudytuanis
 ```
 ┌─────────────┐     ┌──────────────┐     ┌───────────────┐
 │  Cron Job    │────▶│ edus_citas   │────▶│  EDUS CCSS    │
-│  (6am-8am)   │     │   .py        │     │  (Playwright) │
+│  (5:59-8am)  │     │   .py        │     │  (Playwright) │
 └─────────────┘     └──────┬───────┘     └───────────────┘
                            │
                     ┌──────▼───────┐
@@ -85,13 +87,14 @@ Este proyecto fue generado a partir de la **guía/skill base** de **[jeudytuanis
 
 ### Flujo de trabajo
 
-1. **Cron job** ejecuta el script a las 6:00 AM CST
-2. **Playwright** navega al sitio EDUS y descarga el CAPTCHA
+1. **Cron job** ejecuta el script a las 5:59 AM hora CR (cuando se liberan los cupos), luego cada 5 min hasta las 8 AM
+2. **Playwright** navega al sitio EDUS, cierra cualquier sesión previa y descarga el CAPTCHA
 3. **Visión de IA** lee el CAPTCHA y escribe el resultado
 4. El script **inicia sesión** con las credenciales
 5. **Busca cupos** de la especialidad configurada
 6. **Reserva** el primer cupo disponible (con verificación real de éxito)
 7. **Notifica** al usuario con los detalles de la cita
+8. **Cierra sesión** en EDUS para no dejar sesiones pegadas
 
 ---
 
@@ -208,8 +211,9 @@ VISION_BASE_URL=https://api.openai.com/v1
 VISION_API_KEY=tu_api_key
 VISION_MODEL=gpt-4o-mini
 
-# Hora (CR) de la búsqueda programada
+# Hora (CR) de la búsqueda programada — los cupos se liberan a las 5:59 AM
 HORA_BUSQUEDA=5
+MINUTO_BUSQUEDA=59
 ```
 
 ### Resolución de CAPTCHA
@@ -275,7 +279,7 @@ docker compose up -d --build
 
 Esto levanta:
 - **`bot`** — el bot de Telegram (siempre activo)
-- **`cron`** — búsquedas automáticas cada 5 min entre 5-7 AM (hora CR)
+- **`cron`** — búsquedas automáticas: primera corrida a las **5:59 AM** y luego cada 5 min hasta las 8 AM (hora CR)
 
 ### Comandos útiles
 
@@ -295,7 +299,7 @@ docker compose down -v         # detener y borrar volúmenes (BD incluida)
 
 ### Notas Docker
 
-- La hora de las búsquedas programadas se controla con `HORA_BUSQUEDA`/`MINUTO_BUSQUEDA` en el `.env` (default 5:00 AM CR).
+- La hora de las búsquedas programadas se controla con `HORA_BUSQUEDA`/`MINUTO_BUSQUEDA` en el `.env` (default **5:59 AM CR**, cuando se liberan los cupos).
 - El servicio `cron` solo es necesario si quieres búsquedas automáticas sin que nadie use el bot; con el bot activo, `/programar` cubre esa función.
 
 ---
@@ -308,8 +312,9 @@ docker compose down -v         # detener y borrar volúmenes (BD incluida)
 # Editar crontab
 crontab -e
 
-# Agregar (cada 5 minutos entre 5am-8am CST)
-*/5 5-7 * * * /ruta/al/edus_citas_schedule.sh
+# Primera corrida a las 5:59 AM (cupos se liberan a esa hora), luego cada 5 min hasta las 8 AM CST
+59 5 * * * /ruta/al/edus_citas_schedule.sh
+*/5 6-7 * * * /ruta/al/edus_citas_schedule.sh
 ```
 
 El wrapper `edus_citas_schedule.sh` verifica el horario antes de ejecutar el script. Si tu intérprete de Python no está en el `PATH`, defínelo con:
@@ -370,9 +375,9 @@ EXCLUIR_FECHAS=15/08/2026,16/08/2026
 
 ## ⚠️ Notas importantes
 
-- Los cupos se liberan a las **5:00 AM CST** aproximadamente
+- Los cupos se liberan a las **5:59 AM** hora Costa Rica
 - El sistema EDUS usa **JSF + PrimeFaces** con ViewState rotativo
-- Las sesiones expiran rápido; cada ciclo inicia un login fresco
+- Las sesiones expiran rápido; el bot cierra la sesión explícitamente al terminar para no dejar sesiones pegadas
 - Solo funciona con **cuentas EDUS reales** de la CCSS Costa Rica
 - Este proyecto **no está afiliado** con la Caja Costarricense de Seguro Social
 
@@ -385,9 +390,13 @@ Este proyecto está basado en el excelente trabajo de **[jeudytuanisapps/automat
 ### Mejoras sobre el proyecto original
 
 - 👁️ **Resolución de CAPTCHA con visión de IA** (LLM con capacidades visuales) en lugar de Tesseract OCR, logrando mayor precisión
-- 🔄 **Auto-reintento inteligente** con descarga de nuevo CAPTCHA si el login falla
+- 🔄 **Auto-reintento inteligente** con descarga de nuevo CAPTCHA si el login falla (dedupe por mtime para no repetir el mismo captcha)
 - ✅ **Verificación real de reserva**: confirma la respuesta del servidor antes de declarar éxito
-- 🛡️ **Credenciales solo por variables de entorno** (nunca hardcodeadas)
+- 🛡️ **Credenciales solo por variables de entorno** (nunca hardcodeadas), cifradas con Fernet en la BD
+- 🤖 **Bot de Telegram completo** con registro, búsqueda inmediata, programada y visión configurable por usuario
+- ⏰ **Sincronizado con la liberación real de cupos**: primera búsqueda a las 5:59 AM CR
+- 🛑 **Cancelación inmediata** desde el bot: mata el proceso completo (script + Chromium)
+- 🚪 **Cierre de sesión explícito** en EDUS al terminar — sin sesiones pegadas que bloqueen logins futuros
 - 📝 **Documentación profesional** en español
 
 ---
