@@ -15,6 +15,9 @@ services:
       - EDUS_DB_PATH=/app/data/edus_bot.db
       - CAPTCHA_DIR=/app/data/captchas
       - TZ=America/Costa_Rica
+      # Los cupos EDUS se liberan a las 5:59am CR
+      - HORA_BUSQUEDA=5
+      - MINUTO_BUSQUEDA=59
     volumes:
       - edus-data:/app/data
       - edus-logs:/app/logs

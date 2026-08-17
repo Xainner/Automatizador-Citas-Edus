@@ -49,9 +49,9 @@ if not TOKEN:
 
 # Zona horaria de Costa Rica (donde vive EDUS)
 TZ_CR = ZoneInfo("America/Costa_Rica")
-# Hora del día en que se ejecuta la búsqueda programada (cupos salen 5-8am)
+# Hora del día en que se ejecuta la búsqueda programada (los cupos se liberan a las 5:59am CR)
 HORA_BUSQUEDA = int(os.environ.get("HORA_BUSQUEDA", "5"))
-MINUTO_BUSQUEDA = int(os.environ.get("MINUTO_BUSQUEDA", "0"))
+MINUTO_BUSQUEDA = int(os.environ.get("MINUTO_BUSQUEDA", "59"))
 
 # ── Modelo de visión IA (OpenAI-compatible) para resolver CAPTCHAs ──
 # Si no se configuran, el bot le pide al usuario que resuelva el captcha.
