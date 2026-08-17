@@ -333,6 +333,7 @@ async def ejecutar_busqueda(chat, user, fecha_objetivo: str = ""):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=env,
+            start_new_session=True,  # grupo propio: matar el árbol completo al cancelar
         )
     except Exception as e:
         await chat.send_message(f"❌ No pude iniciar la búsqueda: {e}")
@@ -353,7 +354,11 @@ async def ejecutar_busqueda(chat, user, fecha_objetivo: str = ""):
             texto = linea.decode(errors="replace").strip()
             print(f"[edus] {texto}")  # log local
 
-            if "LOGIN EXITOSO" in texto:
+            if "CANCELADO" in texto:
+                print("[bot] El script confirmó la cancelación")
+                resultado = "cancelada"
+                break
+            elif "LOGIN EXITOSO" in texto:
                 await chat.send_message("✅ Entré al sistema de EDUS con tus datos.")
             elif "cupo(s) disponible" in texto:
                 await chat.send_message("🎯 ¡Hay cupos disponibles! Voy a intentar reservar uno.")
@@ -387,13 +392,18 @@ async def ejecutar_busqueda(chat, user, fecha_objetivo: str = ""):
         _procesos.pop(chat.id, None)
         _ultimo_waiting.pop(chat.id, None)
         _n_captcha.pop(chat.id, None)
+        # Limpiar flag de cancelación para la siguiente búsqueda
+        try:
+            (captcha_dir / "cancel.txt").unlink(missing_ok=True)
+        except Exception:
+            pass
         try:
             await proc.wait()
         except Exception:
             pass
 
     # Si el usuario canceló, reportarlo y terminar
-    if chat.id in _cancelados:
+    if chat.id in _cancelados or resultado == "cancelada":
         _cancelados.discard(chat.id)
         await chat.send_message("🛑 Búsqueda cancelada. Cuando quieras, vuelve a intentar con /buscar.")
         return
@@ -793,10 +803,20 @@ async def cmd_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     proc = _procesos.get(chat_id)
     if proc is not None and proc.returncode is None:
         _cancelados.add(chat_id)
+        # Flag de cancelación: el script edus_citas.py lo revisa en cada espera
         try:
-            proc.terminate()
-        except Exception:
-            pass
+            (CAPTCHA_DIR_BOT / "cancel.txt").write_text(str(chat_id))
+        except Exception as e:
+            print(f"[bot] No se pudo escribir flag de cancelación: {e}")
+        # Matar TODO el grupo de procesos (script + chromium) sin piedad
+        import signal
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            await asyncio.sleep(2)
+            if proc.returncode is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+        except Exception as e:
+            print(f"[bot] killpg: {e}")
         mensajes.append("🛑 Deteniendo la búsqueda en curso…")
 
     if mensajes:

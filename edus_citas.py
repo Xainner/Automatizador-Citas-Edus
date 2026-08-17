@@ -5,6 +5,9 @@ Flujo completo en una sola sesión de navegador.
 
 El script descarga el CAPTCHA, lo mejora y lo guarda, luego PAUSA
 para que Hermes lo lea con visión. Después continúa automáticamente.
+
+El bot puede cancela la búsqueda escribiendo un archivo cancel.txt en
+CAPTCHA_DIR; este script lo verifica en cada espera y sale de inmediato.
 """
 import os
 import sys
@@ -46,7 +49,19 @@ def save_captcha(captcha_bytes):
     return str(improved)
 
 
+def cancelado() -> bool:
+    """True si el bot pidió cancelar esta búsqueda."""
+    return (CAPTCHA_DIR / "cancel.txt").exists()
+
+
 async def main():
+    # Limpiar señales de una ejecución anterior
+    for f in ("cancel.txt", "resolved.txt", "waiting.txt"):
+        try:
+            (CAPTCHA_DIR / f).unlink(missing_ok=True)
+        except Exception:
+            pass
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -60,6 +75,12 @@ async def main():
         """)
 
         for intento in range(1, 16):
+            if cancelado():
+                print("🛑 Cancelado por el usuario")
+                print("CANCELADO")
+                await browser.close()
+                return
+
             print(f"\n{'='*50}")
             print(f"[*] Intento #{intento} — Login como {CEDULA}")
             print(f"{'='*50}")
@@ -82,6 +103,11 @@ async def main():
 
             # Esperar a que los elementos del formulario estén listos (usar JS, no CSS selector)
             for _ in range(20):
+                if cancelado():
+                    print("🛑 Cancelado por el usuario")
+                    print("CANCELADO")
+                    await browser.close()
+                    return
                 ready = await page.evaluate("""
                     () => document.getElementById('formInicioSesion:usuario') !== null
                 """)
@@ -97,6 +123,12 @@ async def main():
             captcha_text = ""
             for wait_sec in range(1, 121):
                 await asyncio.sleep(1)
+                # Cancelación externa (bot /cancelar): salir YA, no seguir intentando
+                if cancelado():
+                    print("  🛑 Cancelado por el usuario")
+                    print("CANCELADO")
+                    await browser.close()
+                    return
                 resolved = CAPTCHA_DIR / "resolved.txt"
                 if resolved.exists():
                     captcha_text = resolved.read_text().strip()
@@ -127,6 +159,12 @@ async def main():
                 })()
             """)
             await asyncio.sleep(6)
+
+            if cancelado():
+                print("🛑 Cancelado por el usuario")
+                print("CANCELADO")
+                await browser.close()
+                return
 
             # ── Verificar resultado ──
             url = page.url
