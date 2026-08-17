@@ -6,8 +6,9 @@ Flujo completo en una sola sesión de navegador.
 El script descarga el CAPTCHA, lo mejora y lo guarda, luego PAUSA
 para que Hermes lo lea con visión. Después continúa automáticamente.
 
-El bot puede cancela la búsqueda escribiendo un archivo cancel.txt en
+El bot puede cancelar la búsqueda escribiendo un archivo cancel.txt en
 CAPTCHA_DIR; este script lo verifica en cada espera y sale de inmediato.
+Al terminar cierra la sesión de EDUS para no dejar sesiones pegadas.
 """
 import os
 import sys
@@ -54,6 +55,25 @@ def cancelado() -> bool:
     return (CAPTCHA_DIR / "cancel.txt").exists()
 
 
+async def cerrar_sesion_edus(page) -> None:
+    """Cierra la sesión EDUS actual para no dejar sesiones pegadas en el servidor.
+
+    EDUS rechaza logins nuevos mientras haya una sesión activa desde la misma
+    IP/equipo. El logout explícito evita que este script deje la sesión abierta.
+    """
+    for path in (
+        "/CitasWebPF/faces/xhtml/seguridad/Logout.xhtml",
+        "/CitasWebPF/faces/xhtml/centroSalud/salir.xhtml",
+        "/CitasWebPF/faces/xhtml/seguridad/cerrarSesion.xhtml",
+    ):
+        try:
+            await page.goto(f"https://edus.ccss.sa.cr{path}",
+                            wait_until="domcontentloaded", timeout=20000)
+            await asyncio.sleep(2)
+        except Exception:
+            continue
+
+
 async def main():
     # Limpiar señales de una ejecución anterior
     for f in ("cancel.txt", "resolved.txt", "waiting.txt"):
@@ -86,6 +106,8 @@ async def main():
             print(f"{'='*50}")
 
             # ── Cargar login ──
+            # Cerrar sesión previa del contenedor para no chocar con ella
+            await cerrar_sesion_edus(page)
             await page.goto("https://edus.ccss.sa.cr/eduscitasweb/", wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(3)
 
@@ -196,18 +218,7 @@ async def main():
             # Si el error es sobre sesión existente, intentar cerrar sesión
             if "Ya existe un usuario" in str(errors):
                 print("  ⚠️ Hay sesión activa, intentando cerrar...")
-                try:
-                    await page.evaluate("""
-                        (() => {
-                            const btn = document.getElementById('formInicioSesion:btnCerrarSesion')
-                                || document.querySelector('a[href*="logout"]')
-                                || document.querySelector('a[href*="cerrar"]');
-                            if (btn) btn.click();
-                        })()
-                    """)
-                    await asyncio.sleep(2)
-                except:
-                    pass
+                await cerrar_sesion_edus(page)
                 # Recargar la página de login
                 await page.goto("https://edus.ccss.sa.cr/eduscitasweb/", wait_until="domcontentloaded", timeout=30000)
                 await asyncio.sleep(2)
@@ -348,7 +359,10 @@ async def main():
                 else:
                     print("  ⚠️ Cupo no disponible, probando siguiente...")
 
+        # No dejar la sesión pegada en el servidor
+        await cerrar_sesion_edus(page)
         await browser.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
