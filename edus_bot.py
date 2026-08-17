@@ -370,8 +370,11 @@ async def ejecutar_busqueda(chat, user, fecha_objetivo: str = ""):
             waiting = captcha_dir / "waiting.txt"
             if waiting.exists():
                 contenido = waiting.read_text().strip()
-                if contenido != _ultimo_waiting.get(chat.id):
-                    _ultimo_waiting[chat.id] = contenido
+                # El contenido es SIEMPRE la misma ruta (captcha_improved.png);
+                # lo que cambia es el mtime del archivo por intento.
+                mtime = waiting.stat().st_mtime
+                if (contenido, mtime) != _ultimo_waiting.get(chat.id):
+                    _ultimo_waiting[chat.id] = (contenido, mtime)
                     _n_captcha[chat.id] = _n_captcha.get(chat.id, 0) + 1
                     vision = db.obtener_vision(chat.id)
                     await resolver_captcha(chat, captcha_dir, waiting, vision)
