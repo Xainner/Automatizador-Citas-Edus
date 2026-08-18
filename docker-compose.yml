@@ -18,9 +18,9 @@ services:
       # Los cupos EDUS se liberan a las 5:59am CR
       - HORA_BUSQUEDA=5
       - MINUTO_BUSQUEDA=59
-      # Repetir la búsqueda cada 5 min, durante una ventana de 30 min
-      - INTERVALO_REINTENTO_MIN=5
+      # Búsqueda encadenada durante una ventana de 30 min (o hasta reservar)
       - VENTANA_BUSQUEDA_MIN=30
+      - RESPIRO_SEG=3
     volumes:
       - edus-data:/app/data
       - edus-logs:/app/logs
