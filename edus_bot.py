@@ -52,6 +52,10 @@ TZ_CR = ZoneInfo("America/Costa_Rica")
 # Hora del día en que se ejecuta la búsqueda programada (los cupos se liberan a las 5:59am CR)
 HORA_BUSQUEDA = int(os.environ.get("HORA_BUSQUEDA", "5"))
 MINUTO_BUSQUEDA = int(os.environ.get("MINUTO_BUSQUEDA", "59"))
+# La búsqueda programada se reintenta cada INTERVALO_REINTENTO_MIN minutos
+# dentro de una ventana total de VENTANA_BUSQUEDA_MIN minutos (o hasta reservar).
+VENTANA_BUSQUEDA_MIN = int(os.environ.get("VENTANA_BUSQUEDA_MIN", "30"))
+INTERVALO_REINTENTO_MIN = int(os.environ.get("INTERVALO_REINTENTO_MIN", "5"))
 
 # ── Modelo de visión IA (OpenAI-compatible) para resolver CAPTCHAs ──
 # Si no se configuran, el bot le pide al usuario que resuelva el captcha.
@@ -406,7 +410,7 @@ async def ejecutar_busqueda(chat, user, fecha_objetivo: str = ""):
     if chat.id in _cancelados or resultado == "cancelada":
         _cancelados.discard(chat.id)
         await chat.send_message("🛑 Búsqueda cancelada. Cuando quieras, vuelve a intentar con /buscar.")
-        return
+        return False
 
     # Traducir el resultado final
     if resultado == "reservada":
@@ -433,6 +437,8 @@ async def ejecutar_busqueda(chat, user, fecha_objetivo: str = ""):
             "⚠️ La búsqueda terminó sin un resultado claro. Intenta de nuevo "
             "con /buscar en unos minutos."
         )
+
+    return resultado == "reservada"
 
 
 async def resolver_captcha(chat, captcha_dir: Path, waiting: Path, vision: dict | None = None):
@@ -621,7 +627,8 @@ async def confirmar_programacion(update, context, user, fecha: str):
     # Guardar en BD
     prog_id = db.programar_busqueda(update.effective_chat.id, fecha)
 
-    # Programar el job de Telegram: 5:00 AM (hora CR) del día indicado
+    # Programar el job de Telegram: 5:59 AM (hora CR) del día indicado,
+    # reintentando cada INTERVALO_REINTENTO_MIN durante VENTANA_BUSQUEDA_MIN min
     try:
         fecha_dt = datetime.strptime(fecha, "%d/%m/%Y")
         cuando = datetime.combine(
@@ -629,10 +636,18 @@ async def confirmar_programacion(update, context, user, fecha: str):
             dt_time(HORA_BUSQUEDA, MINUTO_BUSQUEDA),
             tzinfo=TZ_CR,
         )
-        context.job_queue.run_once(
+        context.job_queue.run_repeating(
             job_busqueda_programada,
-            when=cuando,
-            data={"prog_id": prog_id, "fecha": fecha, "chat_id": update.effective_chat.id},
+            interval=timedelta(minutes=INTERVALO_REINTENTO_MIN),
+            first=cuando,
+            data={
+                "prog_id": prog_id,
+                "fecha": fecha,
+                "chat_id": update.effective_chat.id,
+                "cuando": cuando,
+                "fin_ventana": cuando + timedelta(minutes=VENTANA_BUSQUEDA_MIN),
+                "aviso_enviado": False,
+            },
             name=f"edus_prog_{prog_id}",
         )
     except Exception as e:
@@ -647,8 +662,10 @@ async def confirmar_programacion(update, context, user, fecha: str):
 
     await update.effective_chat.send_message(
         f"📅 *Búsqueda programada* para el *{formatear_fecha(fecha)}*.\n\n"
-        "Cuando llegue el momento, buscaré automáticamente y te avisaré "
-        "por aquí. Puedes cancelarla con /cancelar.",
+        f"Empezaré a las {HORA_BUSQUEDA:02d}:{MINUTO_BUSQUEDA:02d} AM y voy a "
+        f"reintentar cada {INTERVALO_REINTENTO_MIN} min durante "
+        f"{VENTANA_BUSQUEDA_MIN} min (o hasta que encuentre cupo). Te aviso por "
+        "aquí. Puedes cancelarla con /cancelar.",
         parse_mode=ParseMode.MARKDOWN,
     )
     return ConversationHandler.END
@@ -658,6 +675,13 @@ async def job_busqueda_programada(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
     chat_id = data["chat_id"]
     fecha = data["fecha"]
+    ahora = datetime.now(TZ_CR)
+
+    # Ventana agotada: se acabó el tiempo de reintentos
+    if ahora >= data["fin_ventana"]:
+        print(f"[bot] Ventana de búsqueda agotada para #{data['prog_id']}")
+        context.job.schedule_removal()
+        return
 
     if chat_id in _buscando:
         return
@@ -670,23 +694,43 @@ async def job_busqueda_programada(context: ContextTypes.DEFAULT_TYPE):
 
     _buscando.add(chat_id)
     try:
-        # Reintentar el envío inicial: la red puede cortar conexiones idle.
-        # A los x minutos de espera el NAT/firewall suele cerrar el socket.
-        chat = None
-        for intento in range(1, 4):
+        # Aviso inicial solo la primera vez
+        if not data["aviso_enviado"]:
+            data["aviso_enviado"] = True
+            # Reintentar el envío inicial: la red puede cortar conexiones idle.
+            chat = None
+            for intento in range(1, 4):
+                try:
+                    chat = await context.bot.get_chat(chat_id)
+                    await chat.send_message(
+                        f"⏰ ¡Llegó la hora! Busco citas para el *{formatear_fecha(fecha)}*. 🤞",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                    break
+                except Exception as e:
+                    print(f"[bot] ⚠️ Envío inicial falló (intento {intento}): {e}")
+                    if intento == 3:
+                        raise
+                    await asyncio.sleep(5)
+            if chat is None:
+                try:
+                    chat = await context.bot.get_chat(chat_id)
+                except Exception:
+                    chat = None
+        else:
+            # Reintentos posteriores: avisar brevemente
             try:
                 chat = await context.bot.get_chat(chat_id)
-                await chat.send_message(
-                    f"⏰ ¡Llegó la hora! Busco citas para el *{formatear_fecha(fecha)}*. 🤞",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-                break
             except Exception as e:
-                print(f"[bot] ⚠️ Envío inicial falló (intento {intento}): {e}")
-                if intento == 3:
-                    raise
-                await asyncio.sleep(5)
-        await ejecutar_busqueda(chat, user, fecha)
+                print(f"[bot] ⚠️ No pude obtener chat en reintento: {e}")
+                chat = None
+        if chat is None:
+            return
+        reservada = await ejecutar_busqueda(chat, user, fecha)
+        # Si se reservó una cita, detener la cadena de reintentos
+        if reservada:
+            print(f"[bot] Cita reservada, detengo la cadena de rechazos #{data['prog_id']}")
+            context.job.schedule_removal()
     finally:
         _buscando.discard(chat_id)
 
@@ -874,10 +918,18 @@ async def reagendar_pendientes(app: Application):
                 db.marcar_programacion(p["id"], "cancelada")
                 print(f"[bot] Programación #{p['id']} ({p['fecha']}) vencida sin ejecutar → cancelada")
                 continue
-            app.job_queue.run_once(
+            app.job_queue.run_repeating(
                 job_busqueda_programada,
-                when=cuando,
-                data={"prog_id": p["id"], "fecha": p["fecha"], "chat_id": p["telegram_id"]},
+                interval=timedelta(minutes=INTERVALO_REINTENTO_MIN),
+                first=cuando,
+                data={
+                    "prog_id": p["id"],
+                    "fecha": p["fecha"],
+                    "chat_id": p["telegram_id"],
+                    "cuando": cuando,
+                    "fin_ventana": cuando + timedelta(minutes=VENTANA_BUSQUEDA_MIN),
+                    "aviso_enviado": False,
+                },
                 name=f"edus_prog_{p['id']}",
             )
             print(f"[bot] Re-agendada búsqueda #{p['id']} para {p['fecha']} a las {cuando:%H:%M} CR")
