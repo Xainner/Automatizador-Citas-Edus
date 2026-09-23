@@ -17,7 +17,7 @@ Comandos (aparecen en el menú de Telegram):
 Configuración (.env):
   TELEGRAM_BOT_TOKEN — token del bot (BotFather)
   SECRET_KEY         — clave Fernet para cifrar credenciales
-  CAPTCHA_TIMEOUT    — segundos para que el usuario resuelva el captcha (default 60)
+  CAPTCHA_TIMEOUT    — segundos para que el usuario resuelva el captcha (default 100)
 """
 import asyncio
 import os
@@ -74,7 +74,7 @@ PREGUNTAR_FECHA = 10
 # Estados del flujo de configuración de visión
 VIS_URL, VIS_KEY, VIS_MODEL = 20, 21, 22
 
-CAPTCHA_TIMEOUT = int(os.environ.get("CAPTCHA_TIMEOUT", "60"))
+CAPTCHA_TIMEOUT = int(os.environ.get("CAPTCHA_TIMEOUT", "100"))
 
 # Captchas pendientes: chat_id -> (evento asyncio, texto resuelto)
 _captchas = {}
@@ -185,7 +185,8 @@ async def cmd_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /estado — te muestro tus datos y programaciones\n\n"
         "Cuando busque una cita y el sistema pida un código de seguridad, "
         "lo resolveré automáticamente si configuraste /vision; si no, "
-        "te enviaré la imagen y tú me escribes el texto. 🙏",
+        "te enviaré la imagen y tú me escribes el texto (o me mandas una "
+        "foto del código y la leo con IA). 🙏",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -449,10 +450,10 @@ async def resolver_captcha(chat, captcha_dir: Path, waiting: Path, vision: dict 
     img_path = Path(ruta_captcha)
     if not img_path.exists():
         # buscar alternativas en el directorio
-        candidatos = list(captcha_dir.glob("*.png"))
+        candidatos = sorted(captcha_dir.glob("*.png"), key=lambda p: p.stat().st_mtime)
         if not candidatos:
             return
-        img_path = candidatos[-1]
+        img_path = candidatos[-1]  # el más reciente
 
     # 1) Intentar con modelo de visión IA (config del usuario, o env vars)
     texto_ia = await resolver_captcha_con_ia(img_path, vision)
@@ -490,11 +491,13 @@ async def resolver_captcha(chat, captcha_dir: Path, waiting: Path, vision: dict 
     try:
         await asyncio.wait_for(evento.wait(), timeout=CAPTCHA_TIMEOUT)
     except asyncio.TimeoutError:
+        _captchas.pop(chat_id, None)
         await chat.send_message("⏰ Se agotó el tiempo para el código. Reintentando…")
         (captcha_dir / "resolved.txt").write_text("")
         return
 
     texto = _captchas[chat_id]["texto"]
+    _captchas.pop(chat_id, None)
 
     # El usuario canceló mientras esperaba el código
     if texto == "__CANCELAR__":
@@ -552,8 +555,16 @@ async def resolver_captcha_con_ia(img_path: Path, vision: dict | None = None) ->
                 ],
             }
         ],
-        "max_tokens": 10,
+        # 300 tokens: los modelos de razonamiento (qwen3.8-*) se gastan el
+        # presupuesto en reasoning_content y devuelven content vacío cuando
+        # max_tokens es bajo (con 10 devolvían "" y el bot le pedía el captcha
+        # al usuario sin necesidad).
+        "max_tokens": 300,
         "temperature": 0,
+        # Thinking desactivado: además de gastar tokens, con thinking activado
+        # el modelo pierde el último caracter del captcha (verificado: lee
+        # "Z33UME" como "Z33UM" de forma consistente).
+        "chat_template_kwargs": {"enable_thinking": False},
     }
 
     headers = {
@@ -561,16 +572,24 @@ async def resolver_captcha_con_ia(img_path: Path, vision: dict | None = None) ->
         "Content-Type": "application/json",
     }
 
+    url = f"{base_url.rstrip('/')}/chat/completions"
+
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{base_url.rstrip('/')}/chat/completions",
-                json=payload,
-                headers=headers,
-            )
+            resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code in (400, 422):
+                # Proveedor que no acepta chat_template_kwargs: reintentar sin él
+                payload.pop("chat_template_kwargs", None)
+                resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
-            texto = data["choices"][0]["message"]["content"].strip()
+            eleccion = data["choices"][0]
+            texto = (eleccion["message"].get("content") or "").strip()
+            if not texto:
+                print(
+                    "[bot] ⚠️ El modelo devolvió content vacío "
+                    f"(finish_reason={eleccion.get('finish_reason')})"
+                )
         # Limpiar: quedarse solo con caracteres alfanuméricos
         texto = "".join(ch for ch in texto if ch.isalnum())
         print(f"[bot] 🤖 CAPTCHA leído por IA: {texto}")
@@ -590,8 +609,72 @@ async def manejar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pendiente["texto"] = texto
             pendiente["evento"].set()
             return
+    if chat_id in _buscando:
+        await update.message.reply_text(
+            "⚠️ No hay un captcha esperando respuesta ahora mismo. Si era el "
+            "código anterior, ya expiró: espera el próximo captcha y responde ahí."
+        )
+        return
     await update.message.reply_text(
         "No entendí. Usa /ayuda para ver qué puedo hacer."
+    )
+
+
+async def manejar_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """El usuario manda una imagen: se intenta leer con el modelo de visión.
+
+    Sirve para mandar el captcha por foto y que lo lea la IA, o para responder
+    un captcha pendiente con una imagen. Si hay un captcha esperando en este
+    chat, el texto leído se usa como respuesta.
+    """
+    chat = update.effective_chat
+    chat_id = chat.id
+
+    foto = update.message.photo[-1]  # la resolución más grande
+    destino_dir = CAPTCHA_DIR_BOT / "usuario"
+    destino_dir.mkdir(parents=True, exist_ok=True)
+    destino = destino_dir / f"captcha_{chat_id}_{datetime.now():%Y%m%d_%H%M%S}.png"
+    try:
+        archivo = await foto.get_file()
+        await archivo.download_to_drive(destino)
+    except Exception as e:
+        print(f"[bot] ⚠️ No pude descargar la foto: {e}")
+        await chat.send_message("❌ No pude descargar la imagen. Intenta de nuevo.")
+        return
+
+    vision = db.obtener_vision(chat_id)
+    if not vision and not (VISION_BASE_URL and VISION_API_KEY and VISION_MODEL):
+        await chat.send_message(
+            "⚠️ No tengo un modelo de visión configurado. Configúralo con "
+            "/vision o escríbeme el texto del captcha a mano."
+        )
+        return
+
+    texto = await resolver_captcha_con_ia(destino, vision)
+    if not texto:
+        await chat.send_message(
+            "❌ No pude leer el código en esa imagen. Prueba con una captura "
+            "más nítida o escríbeme el texto a mano."
+        )
+        return
+
+    pendiente = _captchas.get(chat_id)
+    if pendiente and not pendiente["evento"].is_set():
+        # Es la respuesta al captcha que la búsqueda está esperando
+        pendiente["texto"] = texto
+        pendiente["evento"].set()
+        return
+
+    await chat.send_message(f"🤖 Leí: {texto}")
+
+
+async def manejar_otro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mensajes que no son texto ni foto (voz, sticker, documento, video)."""
+    if update.message.sticker:
+        return  # los stickers se ignoran en silencio
+    await update.effective_chat.send_message(
+        "🤖 Solo entiendo texto e imágenes. Escríbeme lo que necesitas o usa "
+        "/ayuda."
     )
 
 
@@ -1018,6 +1101,9 @@ def main():
     app.add_handler(CommandHandler("cancelar", cmd_cancelar))
     app.add_handler(CommandHandler("estado", cmd_estado))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manejar_texto))
+    app.add_handler(MessageHandler(filters.PHOTO, manejar_foto))
+    # Último: cualquier otro tipo de mensaje (voz, documentos, video)
+    app.add_handler(MessageHandler(filters.ALL, manejar_otro))
 
     print("🤖 Bot EDUS iniciado. Esperando mensajes…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
